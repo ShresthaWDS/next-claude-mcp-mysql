@@ -4,7 +4,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import path from "path";
 
-export const runtime = "nodejs"; // REQUIRED for MCP stdio
+export const runtime = "nodejs";
 
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY!,
@@ -15,9 +15,7 @@ export async function POST(req: NextRequest) {
 
   try {
     const { prompt } = await req.json();
-    console.log("Received prompt:", prompt);
 
-    // ✅ Resolve MCP server path
     const serverPath = path.join(
       process.cwd(),
       "..",
@@ -26,13 +24,11 @@ export async function POST(req: NextRequest) {
       "server.js"
     );
 
-    // ✅ Start MCP transport
     const transport = new StdioClientTransport({
       command: "node",
       args: [serverPath],
     });
 
-    // ✅ Create MCP client
     mcpClient = new Client(
       { name: "dashboard-client", version: "1.0.0" },
       { capabilities: { sampling: {} } }
@@ -40,7 +36,6 @@ export async function POST(req: NextRequest) {
 
     await mcpClient.connect(transport);
 
-    // ✅ Get MCP tools
     const toolsResponse = await mcpClient.listTools();
 
     const tools = toolsResponse.tools.map((tool) => ({
@@ -49,27 +44,42 @@ export async function POST(req: NextRequest) {
       input_schema: tool.inputSchema,
     }));
 
-    // ✅ Initial Claude request
-    const firstResponse = await anthropic.messages.create({
-      model: "claude-3-haiku-20240307",
-      max_tokens: 500,
-      tools,
-      messages: [
-        {
-          role: "user",
-          content: [{ type: "text", text: prompt }],
-        },
-      ],
-    });
+    // ---------- CLAUDE FIRST CALL ----------
+    let firstResponse;
 
-    // Check if Claude wants to use a tool
-    const toolUse = firstResponse.content.find(
+    try {
+      firstResponse = await anthropic.messages.create({
+        model: "claude-3-haiku-20240307",
+        max_tokens: 500,
+        tools,
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "text", text: prompt }],
+          },
+        ],
+      });
+    } catch {
+      await mcpClient.close();
+
+      return Response.json({
+        reply: "AI service temporarily overloaded. Please try again.",
+        data: [],
+        chart: false,
+      });
+    }
+
+    const contentArray = Array.isArray(firstResponse.content)
+      ? firstResponse.content
+      : [];
+
+    const toolUse = contentArray.find(
       (c: any) => c.type === "tool_use"
     ) as any;
 
-    // 🔹 If NO tool use → just return text
+    // ---------- NO TOOL ----------
     if (!toolUse) {
-      const textBlock = firstResponse.content.find(
+      const textBlock = contentArray.find(
         (c: any) => c.type === "text"
       );
 
@@ -77,61 +87,82 @@ export async function POST(req: NextRequest) {
 
       return Response.json({
         reply: textBlock?.text || "No response",
+        data: [],
+        chart: false,
       });
     }
 
-    // 🔹 Execute MCP tool
-    const toolResult = await mcpClient.callTool({
-      name: toolUse.name,
-      arguments: toolUse.input,
-    });
+    // ---------- TOOL EXECUTION ----------
+    let toolText = "[]";
+    let data: any[] = [];
 
-    // Format tool result safely
-    const formattedResult =
-      typeof toolResult.content === "string"
-        ? toolResult.content
-        : JSON.stringify(toolResult.content);
+    try {
+      const toolResult = await mcpClient.callTool({
+        name: toolUse.name,
+        arguments: toolUse.input,
+      });
 
-    // ✅ Second Claude call (CRITICAL STRUCTURE)
-    const finalResponse = await anthropic.messages.create({
-      model: "claude-3-haiku-20240307",
-      max_tokens: 500,
-      messages: [
-        // 1️⃣ Original user message
-        {
-          role: "user",
-          content: [{ type: "text", text: prompt }],
-        },
-        // 2️⃣ Assistant message WITH tool_use (DO NOT FILTER)
-        {
-          role: "assistant",
-          content: firstResponse.content,
-        },
-        // 3️⃣ Tool result referencing tool_use.id
-        {
-          role: "user",
-          content: [
-            {
-              type: "tool_result",
-              tool_use_id: toolUse.id,
-              content: formattedResult,
-            },
-          ],
-        },
-      ],
-    });
+      toolText =
+        toolResult?.content?.[0]?.text ??
+        JSON.stringify(toolResult.content ?? "[]");
 
-    const finalText = finalResponse.content.find(
-      (c: any) => c.type === "text"
-    );
+      try {
+        data = JSON.parse(toolText);
+      } catch {}
+    } catch {
+      toolText = "[]";
+    }
+
+    // ---------- FINAL CLAUDE CALL ----------
+    let finalText = "Query executed successfully.";
+
+    try {
+      const finalResponse = await anthropic.messages.create({
+        model: "claude-3-haiku-20240307",
+        max_tokens: 400,
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "text", text: prompt }],
+          },
+          {
+            role: "assistant",
+            content: contentArray,
+          },
+          {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: toolUse.id,
+                content: toolText,
+              },
+            ],
+          },
+        ],
+      });
+
+      const textBlock = finalResponse.content.find(
+        (c: any) => c.type === "text"
+      );
+
+      if (textBlock?.text) finalText = textBlock.text;
+    } catch {}
 
     await mcpClient.close();
 
+    const wantsChart =
+      prompt.toLowerCase().includes("chart") ||
+      prompt.toLowerCase().includes("graph") ||
+      prompt.toLowerCase().includes("bar");
+
     return Response.json({
-      reply: finalText?.text || "No response",
+      reply: finalText,
+      data,
+      chart: wantsChart,
     });
   } catch (err) {
-    console.error("MCP ERROR:", err);
+    console.error("FATAL:", err);
 
     if (mcpClient) {
       try {
@@ -139,9 +170,10 @@ export async function POST(req: NextRequest) {
       } catch {}
     }
 
-    return Response.json(
-      { error: "AI request failed" },
-      { status: 500 }
-    );
+    return Response.json({
+      reply: "System is running, but AI tools are unavailable.",
+      data: [],
+      chart: false,
+    });
   }
 }
